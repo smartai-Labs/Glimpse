@@ -10,6 +10,7 @@ export default defineConfig({
       input: {
         overview: resolve(__dirname, 'overview/index.html'),
         background: resolve(__dirname, 'src/background/service-worker.ts'),
+        activity: resolve(__dirname, 'src/content/activity.ts'),
       },
       output: {
         entryFileNames: 'assets/[name].js',

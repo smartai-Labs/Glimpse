@@ -8,7 +8,11 @@ interface KeyboardNavProps {
   onSelect: (index: number) => void;
   onCloseTab?: (index: number) => void;
   onFocusSearch?: () => void;
+  onTypeSearch?: (text: string) => void;
   onCloseOverview?: () => void;
+  onEscape?: () => void;
+  selectionMode?: boolean;
+  onSelectAll?: () => void;
   closeShortcut?: ParsedShortcut | null;
 }
 
@@ -96,18 +100,30 @@ export function useKeyboardNavigation({
   onSelect,
   onCloseTab,
   onFocusSearch,
+  onTypeSearch,
   onCloseOverview,
+  onEscape,
+  selectionMode,
+  onSelectAll,
   closeShortcut
 }: KeyboardNavProps) {
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (e.isComposing || e.keyCode === 229 || e.defaultPrevented) return;
     // Ignore keystrokes if focused on an input, unless it's a specific hotkey
     const activeEl = document.activeElement;
     const inInput = activeEl?.tagName === 'INPUT' || activeEl?.tagName === 'TEXTAREA';
 
+    if (selectionMode && !inInput && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a') {
+      e.preventDefault(); onSelectAll?.(); return;
+    }
+    if (selectionMode && !inInput && e.key === ' ' && activeEl?.tagName !== 'BUTTON') {
+      e.preventDefault(); if (!e.repeat) onSelect(selectedIndex); return;
+    }
+
     if (e.key === 'Escape') {
       e.preventDefault();
-      onCloseOverview?.();
+      if (!e.repeat) (onEscape ?? onCloseOverview)?.();
       return;
     }
 
@@ -127,7 +143,7 @@ export function useKeyboardNavigation({
     // CMD+W or CTRL+W
     if ((e.metaKey || e.ctrlKey) && e.key === 'w') {
       e.preventDefault();
-      if (!inInput && selectedIndex >= 0) {
+      if (!selectionMode && !inInput && selectedIndex >= 0) {
         onCloseTab?.(selectedIndex);
       }
       return;
@@ -147,7 +163,15 @@ export function useKeyboardNavigation({
       return;
     }
 
-    e.preventDefault(); // Prevent default scrolling for arrows and space
+    // Let native buttons retain Tab, Space and Enter, including domain and close controls.
+    if (activeEl?.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.length === 1) {
+      e.preventDefault();
+      onTypeSearch?.(e.key);
+      return;
+    }
+    if (!['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp', 'Enter'].includes(e.key) || totalItems === 0) return;
+    e.preventDefault();
 
     let nextIndex = selectedIndex;
 
@@ -173,7 +197,7 @@ export function useKeyboardNavigation({
       onIndexChange(nextIndex);
     }
 
-  }, [totalItems, columns, selectedIndex, onIndexChange, onSelect, onCloseTab, onFocusSearch, onCloseOverview, closeShortcut]);
+  }, [totalItems, columns, selectedIndex, onIndexChange, onSelect, onCloseTab, onFocusSearch, onTypeSearch, onCloseOverview, onEscape, closeShortcut, selectionMode, onSelectAll]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);

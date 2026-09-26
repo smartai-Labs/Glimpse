@@ -6,7 +6,7 @@ set -e
 echo "Building the extension..."
 npm run build
 
-ZIP_NAME="mosaic-extension.zip"
+ZIP_NAME="glimpse-extension.zip"
 
 echo "Packaging the extension into $ZIP_NAME..."
 

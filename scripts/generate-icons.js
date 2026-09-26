@@ -12,7 +12,7 @@ execSync('npm install --no-save sharp --legacy-peer-deps', { stdio: 'inherit' })
 const sharp = await import('sharp');
 
 const sizes = [16, 32, 48, 128];
-const inputSvg = path.join(process.cwd(), 'public', 'mosaic-logo.svg');
+const inputSvg = path.join(process.cwd(), 'public', 'glimpse-logo.svg');
 
 for (const size of sizes) {
   const outputPath = path.join(process.cwd(), 'public', `icon-${size}.png`);

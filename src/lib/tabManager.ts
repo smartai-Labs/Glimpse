@@ -6,6 +6,7 @@ export interface TabInfo {
   windowId: number;
   active: boolean;
   index: number;
+  incognito?: boolean;
 }
 
 export async function getAllTabs(): Promise<TabInfo[]> {
@@ -24,7 +25,8 @@ export async function getAllTabs(): Promise<TabInfo[]> {
       favIconUrl: tab.favIconUrl || '',
       windowId: tab.windowId,
       active: tab.active,
-      index: tab.index
+      index: tab.index,
+      incognito: tab.incognito
     }));
 
   const targetWindowId = lastFocused ? lastFocused.id : mappedTabs.find(t => t.active)?.windowId;

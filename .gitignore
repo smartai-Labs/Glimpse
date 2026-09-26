@@ -23,3 +23,11 @@ dist-ssr
 *.sln
 *.sw?
 *.zip
+
+# Local environment and generated debug captures
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+/ui-*.png
+/docs/*-narrow.png
