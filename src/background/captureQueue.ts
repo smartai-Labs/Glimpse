@@ -6,6 +6,7 @@ export class CaptureQueue {
   private jobs = new Map<number, Job>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
+  private waiters = new Map<number, ((result: CaptureResult) => void)[]>();
   private capture: (tabId: number) => Promise<CaptureResult>;
   constructor(capture: (tabId: number) => Promise<CaptureResult>) { this.capture = capture; }
 
@@ -17,7 +18,12 @@ export class CaptureQueue {
     this.arm();
   }
 
-  cancel(tabId: number) { this.jobs.delete(tabId); this.arm(); }
+  request(tabId: number): Promise<CaptureResult> {
+    return new Promise(resolve => { this.waiters.set(tabId, [...(this.waiters.get(tabId) ?? []), resolve]); this.schedule(tabId, 0); });
+  }
+  cancel(tabId: number) {
+    this.jobs.delete(tabId); this.waiters.get(tabId)?.forEach(resolve => resolve('skip')); this.waiters.delete(tabId); this.arm();
+  }
 
   private arm() {
     clearTimeout(this.timer);
@@ -31,13 +37,15 @@ export class CaptureQueue {
     const next = [...this.jobs.values()].sort((a, b) => a.due - b.due)[0];
     if (!next) return;
     this.jobs.delete(next.tabId);
+    const waiters = this.waiters.get(next.tabId) ?? []; this.waiters.delete(next.tabId);
+    let outcome: CaptureResult = 'skip';
     this.running = true;
     try {
-      const result = await this.capture(next.tabId);
+      const result = await this.capture(next.tabId); outcome = result;
       if (result === 'retry' && next.attempt < 2 && !this.jobs.has(next.tabId)) {
         this.jobs.set(next.tabId, { ...next, attempt: next.attempt + 1, due: Date.now() + 1200 * (next.attempt + 1) });
       }
     } catch { /* Later browsing events or the recovery alarm can try again. */ }
-    finally { this.running = false; this.arm(); }
+    finally { waiters.forEach(resolve => resolve(outcome)); this.running = false; this.arm(); }
   }
 }

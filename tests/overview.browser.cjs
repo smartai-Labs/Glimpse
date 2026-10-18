@@ -32,7 +32,7 @@ const server = http.createServer((req, res) => {
 (async () => {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const browser = await chromium.launch({ channel: process.env.GLIMPSE_BROWSER_CHANNEL || 'chrome', headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1080, height: 900 } });
     const errors = [];
@@ -46,11 +46,19 @@ const server = http.createServer((req, res) => {
       window.testTabs = Array.from({ length: 120 }, (_, i) => ({ id: i + 1, title: `页面 ${i + 1} · ${i % 2 ? '写作' : '项目'}`, url: `https://${hosts[i % 4]}/page/${i + 1}`, windowId: Math.floor(i / 40) + 1, active: i === 0, index: i % 40 }));
       window.calls = []; window.close = () => window.calls.push(['close-overview']);
       window.testSession = { thumbnailSession: 'test-session', ...JSON.parse(sessionStorage.getItem('mosaic-test-storage') || '{}') };
+      window.testLocal = JSON.parse(localStorage.getItem('glimpse-test-local') || '{}');
       window.closedSessions = [];
       window.lastFocusedWindow = Number(sessionStorage.getItem('mosaic-test-focused')) || 1;
       window.chrome = {
-        runtime: { getURL: p => location.origin + '/extension/' + p.replace(/^\//, ''), onMessage: event() },
-        storage: { session: { get: async () => window.testSession, set: async values => { Object.assign(window.testSession, values); sessionStorage.setItem('mosaic-test-storage', JSON.stringify(window.testSession)); } } },
+        runtime: { getManifest: () => ({ version: '1.12.0' }), sendMessage: async message => {
+          const cache = await import('/cache-test.js');
+          if (message.action === 'stats') return { ok: true, value: await cache.getCacheStats() };
+          if (message.action === 'clear') { await cache.clearThumbnails(message.host); chrome.runtime.onMessage.emit({type:'glimpse:cache-changed'}); return {ok:true,value:await cache.getCacheStats()}; }
+          if (message.action === 'settings') { await chrome.storage.local.set({glimpsePreviewSettings:message.settings}); for(const host of message.settings.excludedHosts) await cache.clearThumbnails(host); chrome.runtime.onMessage.emit({type:'glimpse:cache-changed'});return {ok:true,value:message.settings}; }
+          if (message.action === 'refresh') return {ok:true,value:1};
+          return {ok:false};
+        }, getURL: p => location.origin + '/extension/' + p.replace(/^\//, ''), onMessage: event() },
+        storage: { onChanged: event(), local: { get: async () => window.testLocal, set: async values => { Object.assign(window.testLocal, values); localStorage.setItem('glimpse-test-local', JSON.stringify(window.testLocal)); chrome.storage.onChanged.emit(Object.fromEntries(Object.entries(values).map(([key, newValue]) => [key, { newValue }])), 'local'); } }, session: { get: async () => window.testSession, set: async values => { Object.assign(window.testSession, values); sessionStorage.setItem('mosaic-test-storage', JSON.stringify(window.testSession)); } } },
         sessions: {
           getRecentlyClosed: async () => window.closedSessions,
           restore: async sessionId => {
@@ -80,6 +88,7 @@ const server = http.createServer((req, res) => {
             return tab;
           },
           query: async (query = {}) => {
+            window.tabQueries = (window.tabQueries || 0) + 1;
             const delay = Number(new URL(location.href).searchParams.get('delayTabs') || 0);
             if (delay) await new Promise(resolve => setTimeout(resolve, delay));
             return window.testTabs.filter(tab => (query.windowId === undefined || tab.windowId === query.windowId) && (query.groupId === undefined || tab.groupId === query.groupId) && (query.pinned === undefined || !!tab.pinned === query.pinned));
@@ -93,10 +102,11 @@ const server = http.createServer((req, res) => {
             window.testTabs = window.testTabs.filter(t => t.id !== id); window.chrome.tabs.onRemoved.emit(id);
           },
           create: async options => { window.calls.push(['create-tab', options]); },
-          ...Object.fromEntries(['onMoved','onDetached','onAttached','onCreated','onRemoved','onUpdated','onActivated'].map(name => [name, event()]))
+          ...Object.fromEntries(['onMoved','onDetached','onAttached','onCreated','onRemoved','onUpdated','onActivated','onReplaced'].map(name => [name, event()]))
         }
       };
     };
+    const selectWebsite = async (target, name) => { await target.getByRole('button', { name: '按网站筛选', exact: true }).click(); await target.getByRole('dialog', { name: '按网站筛选' }).getByRole('button', { name: new RegExp('^' + name.replaceAll('.', '\\.')) }).click(); };
     await page.addInitScript(setupBrowser);
     await page.goto(base + '/fixture');
     await page.evaluate(async () => {
@@ -150,7 +160,7 @@ const server = http.createServer((req, res) => {
     assert((await scale(1)) > 1 && (await scale(2)) > 1, 'old and new card animate concurrently');
     assert.equal(await cell(2).locator('.tab-placeholder').count(), 1, 'missing thumbnails also enlarge');
     assert.equal(await cell(2).locator('.placeholder-title').innerText(), '页面 2 · 写作', 'a missing preview shows the real page title');
-    assert.equal(await cell(2).locator('.placeholder-status').innerText(), '暂无预览');
+    assert.equal(await cell(2).locator('.placeholder-status').innerText(), '浏览后生成预览');
     assert.equal(await cell(1).locator('.thumbnail-badge').innerText(), '上次浏览');
     const firstScreenshot = await cell(1).locator('.tab-screenshot').getAttribute('src');
     const newScreenshot = await page.evaluate(async () => {
@@ -165,6 +175,46 @@ const server = http.createServer((req, res) => {
     assert.notEqual(firstScreenshot, newScreenshot);
     await page.waitForFunction(image => document.querySelector('[data-tab-id="1"] .tab-screenshot')?.getAttribute('src') === image, newScreenshot);
     assert.equal(await cell(1).locator('.thumbnail-badge').count(), 0, 'new screenshot replaces old cache without reopening overview');
+    // New status notifications must not erase an existing same-URL image.
+    await page.evaluate(() => {
+      for (const id of [1, 2]) {
+        const tab = window.testTabs.find(tab => tab.id === id);
+        window.testSession['glimpse:preview:' + id] = { url: tab.url, status: 'permission', capturedAt: 1000, dirtyAt: 2000, failures: 1, blockedUntil: Date.now() + 300000 };
+        chrome.runtime.onMessage.emit({ type: 'glimpse:preview-state', tabId: id, url: tab.url });
+      }
+    });
+    await page.waitForFunction(() => document.querySelector('[data-tab-id="2"] .placeholder-status')?.textContent === '需要访问权限');
+    assert.equal(await cell(1).locator('.tab-screenshot').getAttribute('src'), newScreenshot, 'capture errors preserve a usable image');
+    assert.equal(await cell(1).locator('.thumbnail-badge').innerText(), '已保存预览');
+    assert((await cell(2).locator('.tab-hit').getAttribute('aria-description')).includes('扩展详情'), 'permission state includes an actionable accessible hint');
+    await page.evaluate(() => {
+      window.testTabs[1].status = 'loading'; chrome.tabs.onUpdated.emit(2, { status: 'loading' }, window.testTabs[1]);
+    });
+    await page.waitForFunction(() => document.querySelector('[data-tab-id="2"] .placeholder-status')?.textContent === '页面加载中');
+    await page.evaluate(() => {
+      window.testTabs[1].status = 'complete'; chrome.tabs.onUpdated.emit(2, { status: 'complete' }, window.testTabs[1]);
+      for (const id of [1, 2]) {
+        delete window.testSession['glimpse:preview:' + id];
+        chrome.runtime.onMessage.emit({ type: 'glimpse:preview-state', tabId: id, url: window.testTabs[id - 1].url });
+      }
+    });
+    await page.waitForFunction(() => document.querySelector('[data-tab-id="2"] .placeholder-status')?.textContent === '浏览后生成预览');
+    const queriesBeforeMetadata = await page.evaluate(() => window.tabQueries);
+    await page.evaluate(() => {
+      for (let i = 0; i < 40; i++) {
+        window.testTabs[1].title = '增量更新标题 ' + i;
+        chrome.tabs.onUpdated.emit(2, { title: window.testTabs[1].title }, window.testTabs[1]);
+      }
+      chrome.tabs.onActivated.emit({ tabId: 2, windowId: 1 });
+    });
+    await page.waitForFunction(() => document.querySelector('[data-tab-id="2"] .tab-title')?.textContent === '增量更新标题 39');
+    assert.equal(await page.evaluate(() => window.tabQueries), queriesBeforeMetadata, 'title and activation events do not query every tab');
+    await page.evaluate(() => chrome.tabs.onActivated.emit({ tabId: 1, windowId: 1 }));
+    const queriesBeforeBurst = await page.evaluate(() => window.tabQueries);
+    await page.evaluate(() => { for (let i = 0; i < 50; i++) chrome.tabs.onMoved.emit(2, { windowId: 1 }); });
+    await page.waitForFunction(before => window.tabQueries > before, queriesBeforeBurst);
+    await page.waitForTimeout(180);
+    assert.equal(await page.evaluate(() => window.tabQueries), queriesBeforeBurst + 1, 'structural event burst coalesces into one query');
     const originalOrder = await page.locator('.tab-cell').evaluateAll(els => els.map(el => el.dataset.tabId));
     await page.evaluate(() => {
       window.lastFocusedWindow = 3;
@@ -185,6 +235,9 @@ const server = http.createServer((req, res) => {
     assert.equal(await scale(3), 1);
     await cell(2).locator('.tab-hit').focus(); await page.waitForTimeout(280);
     assert((await scale(2)) > 1.3, 'keyboard focus enlargement survives selection rerender');
+    assert.equal(await cell(2).locator('.tab-surface').evaluate(el => getComputedStyle(el).outlineStyle), 'none', 'focused card has no bright outline');
+    await page.getByRole('searchbox').focus();
+    assert.equal(await page.locator('.overview-search').evaluate(el => getComputedStyle(el).boxShadow), 'none', 'search focus has no inset ring');
     if (process.env.MOSAIC_SCREENSHOT) await page.screenshot({ path: process.env.MOSAIC_SCREENSHOT });
     await hoverCard(2); await page.mouse.down(); await page.mouse.up();
     assert.deepEqual(await page.evaluate(() => window.calls.filter(c => c[0] === 'select-tab').map(c => c[1])), [2], 'one click selects correct tab');
@@ -193,14 +246,17 @@ const server = http.createServer((req, res) => {
     await page.mouse.move(close3.x + close3.width / 2, close3.y + close3.height / 2, { steps: 20 });
     await page.mouse.down(); await page.mouse.up();
     await cell(3).waitFor({ state: 'detached' });
-    assert.deepEqual(await page.locator('.domain-filters [data-domain]').evaluateAll(els => els.map(el => el.dataset.domain)), ['docs.qq.com', 'github.com', 'mp.weixin.qq.com', 'zhihu.com'], 'changing counts never reshuffles website filters');
+    await page.getByRole('button', { name: '按网站筛选', exact: true }).click();
+    assert.deepEqual(await page.locator('.finder-menu [data-domain]').evaluateAll(els => els.map(el => el.dataset.domain)), ['docs.qq.com', 'github.com', 'mp.weixin.qq.com', 'zhihu.com'], 'changing counts never reshuffles website filters');
+    await page.keyboard.press('Escape');
     assert.deepEqual(await page.evaluate(() => window.calls.filter(c => c[0] === 'remove-tab').map(c => c[1])), [3]);
     assert.equal(await page.evaluate(() => window.calls.filter(c => c[0] === 'select-tab').length), 1, 'close does not select');
-    await page.getByRole('button', { name: /^github.com/ }).click();
+    await selectWebsite(page, 'github.com');
     assert.equal(await page.locator('.tab-count').innerText(), '30 个标签');
     assert(await page.locator('.tab-domain').evaluateAll(els => els.every(el => el.textContent === 'github.com')));
     await page.getByRole('searchbox').fill('不存在的内容xyz');
-    await page.getByRole('button', { name: '清除筛选' }).click();
+    await page.getByRole('button', { name: '清空搜索' }).click();
+    await page.getByRole('button', { name: '清除网站和窗口筛选' }).click();
     assert.equal(await page.locator('.tab-count').innerText(), '119 个标签');
     if (process.env.MOSAIC_SCREENSHOT) await page.screenshot({ path: process.env.MOSAIC_SCREENSHOT });
     await page.getByRole('button', { name: /^撤销/ }).click();
@@ -212,11 +268,11 @@ const server = http.createServer((req, res) => {
     await cell(2).getByRole('button', { name: '只看窗口 1' }).click();
     assert.equal(await page.locator('.tab-count').innerText(), '40 个标签');
     assert.equal(await page.evaluate(() => window.calls.filter(c => c[0] === 'select-tab').length), switchesBeforeFilter, 'window filter does not activate tab');
-    await page.getByRole('button', { name: /^github.com/ }).click();
+    await selectWebsite(page, 'github.com');
     assert.equal(await page.locator('.tab-count').innerText(), '10 个标签', 'domain and window filters compose');
     await page.getByRole('button', { name: '取消窗口 1 筛选' }).click();
     assert.equal(await page.locator('.tab-count').innerText(), '30 个标签');
-    await page.getByRole('button', { name: /^全部/ }).click();
+    await page.getByRole('button', { name: '清除网站和窗口筛选' }).click();
     assert.equal(await page.locator('.tab-count').innerText(), '120 个标签');
     // Removing another window must not renumber survivors; filtering an empty window is reversible.
     await page.evaluate(() => { window.testTabs = window.testTabs.filter(t => t.windowId !== 2); chrome.tabs.onRemoved.emit(41); });
@@ -226,7 +282,7 @@ const server = http.createServer((req, res) => {
     assert.equal(await cell(120).getByRole('button', { name: '只看窗口 3' }).count(), 1);
     await cell(120).getByRole('button', { name: '只看窗口 3' }).click();
     assert.equal(await page.locator('.tab-count').innerText(), '40 个标签');
-    await page.getByRole('button', { name: /^全部/ }).click();
+    await page.getByRole('button', { name: '清除网站和窗口筛选' }).click();
     await page.getByRole('searchbox').focus();
     const before = await page.evaluate(() => window.calls.length);
     await page.getByRole('searchbox').dispatchEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true, bubbles: true });
@@ -271,10 +327,10 @@ const server = http.createServer((req, res) => {
     await cell(700).getByRole('button', { name: '只看窗口 4' }).click();
     assert.equal(await page.locator('.tab-count').innerText(), '1 个标签');
     await cell(700).locator('.tab-close').focus(); await page.keyboard.press('Enter');
-    await page.getByText('没有找到标签页', { exact: false }).waitFor();
+    await page.getByText('当前筛选范围内没有匹配的页面', { exact: false }).waitFor();
     await page.getByRole('button', { name: /^撤销/ }).click();
     await cell(1700).waitFor(); assert.equal(await page.locator('.tab-count').innerText(), '1 个标签');
-    await page.getByRole('button', { name: /^全部/ }).click();
+    await page.getByRole('button', { name: '清除网站和窗口筛选' }).click();
     // Undo notification expires without moving the grid or leaving a stale button.
     await page.clock.install();
     await cell(1).locator('.tab-close').focus(); await page.keyboard.press('Enter');
@@ -300,8 +356,8 @@ const server = http.createServer((req, res) => {
     const cacheResults = await page.evaluate(async () => {
       const cache = await import('/cache-test.js');
       const url = 'https://duplicate.example/same';
-      await cache.storeThumbnail('test-session', 200, url, 'image-A');
-      await cache.storeThumbnail('test-session', 201, url, 'image-B');
+      await cache.storeThumbnail('test-session', 200, url, 'data:image/png;base64,aW1hZ2UtQQ==');
+      await cache.storeThumbnail('test-session', 201, url, 'data:image/png;base64,aW1hZ2UtQg==');
       const a = await cache.getThumbnail(200, url), b = await cache.getThumbnail(201, url);
       const unseen = await cache.getThumbnail(202, url);
       window.testSession.thumbnailSession = 'next-session';
@@ -328,13 +384,42 @@ const server = http.createServer((req, res) => {
       const request = db.transaction('keyval').objectStore('keyval').count();
       const count = await new Promise(resolve => { request.onsuccess = () => resolve(request.result); });
       db.close();
-      return { a, b, unseen, restored, resized, expired, count };
+      return { a, b, unseen, restored, resized, expired, count, stats: await cache.getCacheStats() };
     });
-    assert.equal(cacheResults.a.dataUrl, 'image-A'); assert.equal(cacheResults.b.dataUrl, 'image-B');
+    assert.equal(cacheResults.a.dataUrl, 'data:image/png;base64,aW1hZ2UtQQ=='); assert.equal(cacheResults.b.dataUrl, 'data:image/png;base64,aW1hZ2UtQg==');
     assert.equal(cacheResults.unseen, null, 'new same-URL tabs never borrow another live tab image');
     assert.equal(cacheResults.restored.previous, true, 'browser restart uses clearly marked previous-session image');
     assert.deepEqual(cacheResults.resized, { width: 640, height: 400, serviceWorker: true });
-    assert.equal(cacheResults.expired, null); assert(cacheResults.count <= 500);
+    assert.equal(cacheResults.expired, null); assert(cacheResults.stats.images <= 500); assert(cacheResults.stats.bytes <= cacheResults.stats.limit);
+    const migration = await page.evaluate(async () => {
+      const cache = await import('/cache-test.js'); await cache.clearThumbnails();
+      window.testSession.thumbnailSession = 'test-session';
+      const image = 'data:image/png;base64,aW1hZ2U=', url = 'https://legacy.test/page?q=1#x';
+      const request = indexedDB.open('keyval-store'); const db = await new Promise(resolve => { request.onsuccess = () => resolve(request.result); });
+      const write = async pairs => { const tx = db.transaction('keyval','readwrite'); pairs.forEach(([key,value])=>tx.objectStore('keyval').put(value,key)); await new Promise((resolve,reject)=>{tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);}); };
+      const readAll = async () => {const tx=db.transaction('keyval'); const request=tx.objectStore('keyval').getAll(); return new Promise(resolve=>{request.onsuccess=()=>resolve(request.result);});};
+      const legacy={dataUrl:image,url,timestamp:Date.now(),session:'test-session',tabId:701};
+      await write([['mosaic:tab:test-session:701',legacy],['mosaic:url:'+url,legacy]]);
+      const nativePut=IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put=function(value,key){ if(typeof key==='string'&&key.startsWith('glimpse:image:'))throw new Error('simulated quota');return nativePut.call(this,value,key); };
+      await cache.pruneThumbnails('test-session');
+      IDBObjectStore.prototype.put=nativePut;
+      const fallback=await cache.getThumbnail(701,url), failedValues=await readAll();
+      await cache.pruneThumbnails('test-session'); const migrated=await readAll(), stats=await cache.getCacheStats();
+      const exact=await cache.getThumbnail(701,url), unseen=await cache.getThumbnail(702,url);
+      window.testSession.thumbnailSession='restart';const previous=await cache.getThumbnail(701,url);window.testSession.thumbnailSession='test-session';
+      await cache.storeThumbnail('test-session',702,'https://kept.test/path',image);
+      await cache.clearThumbnails('legacy.test');const removed=await cache.getThumbnail(701,url),kept=await cache.getThumbnail(702,'https://kept.test/path');
+      const perSite=await cache.getCacheStats();
+      await cache.clearThumbnails();const empty=await cache.getCacheStats();db.close();
+      return {fallback,failedLegacy:failedValues.filter(value=>value.dataUrl).length,images:migrated.filter(value=>value.blob instanceof Blob).length,refs:migrated.filter(value=>value.imageId).map(value=>value.imageId),stats,exact,unseen,previous,removed,kept,perSite,empty};
+    });
+    assert.equal(migration.failedLegacy,2,'failed migration leaves both original records intact');
+    assert.equal(migration.fallback.dataUrl,migration.exact.dataUrl);
+    assert.equal(migration.images,1);assert.equal(new Set(migration.refs).size,1,'both indexes share one Blob');
+    assert.equal(migration.stats.images,1);assert.equal(migration.unseen,null);assert(migration.previous.previous);
+    assert.equal(migration.removed,null);assert(migration.kept);assert.equal(migration.perSite.sites.length,1);
+    assert.equal(migration.empty.images,0);assert.equal(migration.empty.bytes,0,'clear removes indexes and images');
     assert.deepEqual(errors, []);
     const findPage = await browser.newPage({ viewport: { width: 1080, height: 900 } });
     await findPage.addInitScript(setupBrowser);
@@ -353,7 +438,7 @@ const server = http.createServer((req, res) => {
     assert.equal(await findPage.evaluate(() => window.calls.find(call => call[0] === 'select-tab')[1]), 117);
     await findPage.keyboard.press('Escape');
     assert.equal(await findPage.getByRole('searchbox').inputValue(), '');
-    await findPage.getByRole('button', { name: /^github.com/ }).click();
+    await selectWebsite(findPage, 'github.com');
     await findPage.getByRole('searchbox').fill('没有这种标题xyz');
     const closedBeforeEscape = await findPage.evaluate(() => window.calls.filter(call => call[0] === 'close-overview').length);
     await findPage.keyboard.press('Escape');
@@ -386,6 +471,84 @@ const server = http.createServer((req, res) => {
     await findPage.waitForTimeout(200);
     assert.deepEqual(await findPage.evaluate(() => window.testSession.mosaicOverviewPosition.order), position.saved.order, 'private browsing never enters saved positions');
     await findPage.close();
+    const finderPage = await browser.newPage({ viewport: { width: 1080, height: 900 } });
+    finderPage.on('pageerror', error => errors.push(error.message));
+    await finderPage.addInitScript(setupBrowser);
+    await finderPage.addInitScript(() => {
+      window.testTabs = window.testTabs.slice(0, 12).map((tab, index) => ({ ...tab, windowId: Math.floor(index / 4) + 1, lastAccessed: 1000 + index }));
+      window.testTabs[0].title = '工程日志'; window.testTabs[0].pinned = true; window.testTabs[0].audible = true;
+      window.testTabs[1].title = '产品设计评审'; window.testTabs[2].discarded = true;
+    });
+    await finderPage.goto(base + '/overview/index.html');
+    await finderPage.locator('[data-tab-id="1"]').waitFor();
+    assert((await finderPage.locator('[data-tab-id="1"] .tab-hit').getAttribute('aria-description')).includes('固定标签，正在发声'));
+    assert.equal(await finderPage.locator('[data-tab-id="1"] .tab-hit').getAttribute('title'), '工程日志');
+    const siteTrigger = finderPage.getByRole('button', { name: '按网站筛选', exact: true });
+    await siteTrigger.focus(); await finderPage.keyboard.press('ArrowDown');
+    const siteInput = finderPage.getByRole('searchbox', { name: '筛选网站' });
+    assert(await siteInput.evaluate(el => el === document.activeElement), 'picker opens with focus in its own search');
+    assert.equal(await siteInput.evaluate(el => getComputedStyle(el).outlineStyle), 'none', 'picker input has no bright focus outline');
+    assert.equal(await siteTrigger.evaluate(el => getComputedStyle(el).outlineStyle), 'none', 'active picker trigger has no bright outline');
+    await siteInput.fill('qq');
+    assert.equal(await finderPage.locator('.finder-menu [data-domain]').count(), 2);
+    const beforePicker = await finderPage.evaluate(() => window.calls.length);
+    await siteInput.dispatchEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true });
+    assert.equal(await finderPage.getByRole('dialog', { name: '按网站筛选' }).count(), 1, 'IME Enter does not choose a site');
+    assert.equal(await finderPage.evaluate(() => window.calls.length), beforePicker);
+    await finderPage.keyboard.press('Escape');
+    assert(await siteTrigger.evaluate(el => el === document.activeElement), 'Escape restores picker trigger focus');
+    assert.equal(await finderPage.evaluate(() => window.calls.length), beforePicker, 'picker Escape cannot close overview');
+    await siteTrigger.click(); await finderPage.keyboard.press('Control+f');
+    assert.equal(await finderPage.getByRole('dialog', { name: '按网站筛选' }).count(), 0);
+    assert(await finderPage.getByRole('searchbox', { name: '搜索标签页' }).evaluate(el => el === document.activeElement), 'global search shortcut also works from a picker');
+    await selectWebsite(finderPage, 'github.com');
+    const finderSearch = finderPage.getByRole('searchbox', { name: '搜索标签页' });
+    await finderSearch.fill('产品设计评审');
+    await finderPage.getByRole('button', { name: '在全部页面查找' }).click();
+    assert.equal(await finderSearch.inputValue(), '产品设计评审', 'expanding scope preserves the query');
+    assert.equal(await finderPage.locator('.tab-count').innerText(), '1 个标签');
+    assert.equal(await finderPage.getByRole('button', { name: '排列方式', exact: true }).innerText(), '相关性');
+    assert.equal(await finderPage.locator('[data-tab-id="2"] .tab-title mark').innerText(), '产品设计评审');
+    assert.equal(await finderPage.getByRole('button', { name: '清除网站和窗口筛选' }).count(), 0);
+    await finderSearch.fill('');
+    await finderPage.getByRole('button', { name: '按窗口筛选', exact: true }).click();
+    await finderPage.getByRole('searchbox', { name: '筛选窗口' }).fill('页面 5');
+    await finderPage.getByRole('dialog', { name: '按窗口筛选' }).getByRole('button', { name: /^窗口 2/ }).click();
+    assert.equal(await finderPage.locator('.tab-count').innerText(), '4 个标签');
+    await finderPage.getByRole('button', { name: '取消窗口 2 筛选' }).click();
+    await finderPage.getByRole('button', { name: '排列方式', exact: true }).click();
+    await finderPage.getByRole('button', { name: '最近使用', exact: true }).click();
+    await finderPage.waitForFunction(() => document.querySelector('.tab-cell')?.getAttribute('data-tab-id') === '12');
+    const recentPrefix = await finderPage.locator('.tab-cell').evaluateAll(nodes => nodes.slice(0, 3).map(node => node.dataset.tabId));
+    assert.deepEqual(recentPrefix, ['12', '11', '10']);
+    await finderPage.evaluate(() => {
+      window.testTabs.forEach(tab => { if (tab.windowId === 1) tab.active = tab.id === 2; });
+      chrome.tabs.onActivated.emit({ tabId: 2, windowId: 1 });
+    });
+    await finderPage.waitForTimeout(120);
+    assert.deepEqual(await finderPage.locator('.tab-cell').evaluateAll(nodes => nodes.slice(0, 3).map(node => node.dataset.tabId)), recentPrefix, 'recent order stays stable while overview is open');
+    await finderPage.getByRole('button', { name: '排列方式', exact: true }).click();
+    await finderPage.getByRole('button', { name: '原有顺序', exact: true }).click();
+    await finderPage.waitForFunction(() => document.querySelector('.tab-cell')?.getAttribute('data-tab-id') === '1');
+    const standardWidth = (await finderPage.locator('.tab-cell').first().boundingBox()).width;
+    await finderPage.getByRole('button', { name: '更多选项', exact: true }).click();
+    await finderPage.getByRole('button', { name: '紧凑', exact: true }).click();
+    await finderPage.waitForFunction(() => document.querySelector('.glimpse-overview').dataset.density === 'compact');
+    assert((await finderPage.locator('.tab-cell').first().boundingBox()).width < standardWidth);
+    await finderPage.reload();
+    await finderPage.waitForFunction(() => document.querySelector('.glimpse-overview')?.dataset.density === 'compact');
+    assert.equal(await finderPage.evaluate(() => window.testLocal.glimpseDisplay.density), 'compact', 'display preference survives reopening');
+    for (const viewport of [{ width: 360, height: 640 }, { width: 540, height: 360 }]) {
+      await finderPage.setViewportSize(viewport);
+      await finderPage.getByRole('button', { name: '更多选项', exact: true }).click();
+      assert.equal(await finderPage.evaluate(() => getComputedStyle(document.activeElement).outlineStyle), 'none', 'focused menu action has no outline');
+      const popup = await finderPage.getByRole('dialog', { name: '更多选项' }).boundingBox();
+      assert(popup.x >= 0 && popup.y >= 0 && popup.x + popup.width <= viewport.width && popup.y + popup.height <= viewport.height, 'popup stays inside narrow and short viewports');
+      assert(await finderPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no horizontal scrollbar with picker controls');
+      if (process.env.GLIMPSE_FINDER_SCREENSHOT) await finderPage.screenshot({ path: process.env.GLIMPSE_FINDER_SCREENSHOT });
+      await finderPage.keyboard.press('Escape');
+    }
+    await finderPage.close();
     const keywordPage = await browser.newPage({ viewport: { width: 1080, height: 900 } });
     keywordPage.on('pageerror', error => errors.push(error.message));
     await keywordPage.addInitScript(setupBrowser);
@@ -451,7 +614,7 @@ const server = http.createServer((req, res) => {
     assert.equal(await keywordPage.evaluate(() => document.activeElement.getAttribute('type')), 'search');
     await keywordPage.keyboard.press('Escape');
     await keywordPage.locator('[data-tab-id="5"]').getByRole('button', { name: '只看窗口 2' }).click();
-    await keywordPage.getByRole('button', { name: /^github.com/ }).click();
+    await selectWebsite(keywordPage, 'github.com');
     assert.equal(await keywordPage.locator('.tab-count').innerText(), '1 个标签');
     await keywordPage.locator('.search-keywords').getByRole('button', { name: 'Claude Code', exact: true }).click();
     assert.equal(await keywordPage.locator('.tab-count').innerText(), '2 个标签', 'global title keywords search across window and website filters');
@@ -498,7 +661,7 @@ const server = http.createServer((req, res) => {
     assert.equal(await keywordPage.evaluate(() => document.activeElement.className), 'keyword-more', 'Escape returns focus to the overflow trigger');
     assert.equal(await keywordPage.evaluate(() => window.calls.filter(call => call[0] === 'close-overview').length), closesBeforeMenuEscape, 'Escape dismisses the menu before clearing or closing');
     await moreKeywords.click();
-    await keywordPage.getByRole('button', { name: '设置照面 Glimpse 快捷键' }).focus();
+    await keywordPage.getByRole('button', { name: '更多选项', exact: true }).focus();
     assert.equal(await keywordPage.locator('.keyword-menu').count(), 0, 'leaving the search controls dismisses the popup');
     if (process.env.MOSAIC_KEYWORD_SCREENSHOT) await keywordPage.screenshot({ path: process.env.MOSAIC_KEYWORD_SCREENSHOT.replace('.png', '-narrow.png') });
     await keywordPage.setViewportSize({ width: 1080, height: 900 });
@@ -553,7 +716,7 @@ const server = http.createServer((req, res) => {
     await batchPage.getByRole('button', { name: '多选', exact: true }).click();
     await batchPage.getByRole('button', { name: '全选结果', exact: true }).click();
     assert.equal(await batchPage.locator('.selection-count').innerText(), '已选 120', 'select all includes virtualized offscreen cards');
-    await batchPage.getByRole('button', { name: /^github.com/ }).click();
+    await selectWebsite(batchPage, 'github.com');
     assert.equal(await batchPage.locator('.selection-count').innerText(), '已选 0', 'changing filters clears hidden selections');
     await batchPage.getByRole('button', { name: '全选结果', exact: true }).click();
     assert.equal(await batchPage.locator('.selection-count').innerText(), '已选 30');
@@ -568,7 +731,7 @@ const server = http.createServer((req, res) => {
     await batchPage.keyboard.press('Escape');
     assert.equal(await batchPage.getByRole('button', { name: '多选', exact: true }).count(), 1, 'Escape exits multiselect first');
     assert.equal(await batchPage.locator('.tab-count').innerText(), '30 个标签');
-    await batchPage.getByRole('button', { name: /^全部/ }).click();
+    await batchPage.getByRole('button', { name: '清除网站和窗口筛选' }).click();
     await batchPage.getByRole('button', { name: '多选', exact: true }).click();
     await batchCard(3).getByRole('checkbox').click(); await batchCard(4).getByRole('checkbox').click();
     await batchPage.evaluate(() => { window.failRemoveIds = [4]; });
@@ -579,20 +742,92 @@ const server = http.createServer((req, res) => {
     await batchPage.getByRole('button', { name: '取消', exact: true }).click();
     await batchPage.getByRole('button', { name: /^撤销/ }).click();
     await batchPage.waitForFunction(() => document.querySelector('.tab-count').textContent === '120 个标签');
-    await batchPage.getByRole('button', { name: /^github.com/ }).click();
+    await selectWebsite(batchPage, 'github.com');
+    await batchPage.getByRole('button', { name: '更多选项', exact: true }).click();
     await batchPage.getByRole('button', { name: '合并窗口', exact: true }).click();
-    await batchPage.locator('.batch-progress').waitFor({ state: 'detached' });
-    assert.equal(await batchPage.locator('.undo-notice').innerText(), '已合并 80 个标签', JSON.stringify(await batchPage.evaluate(() => ({ error: document.querySelector('.overview-error')?.textContent, moved: window.calls.filter(call => call[0] === 'move-tab').length, windows: [...new Set(window.testTabs.map(tab => tab.windowId))] }))));
+    await batchPage.getByRole('button', { name: '合并所选窗口', exact: true }).click();
+    await batchPage.getByRole('dialog', { name: '合并窗口', exact: true }).waitFor({ state: 'detached' });
+    assert.equal(await batchPage.locator('.undo-notice').innerText(), '已移动 80 个页面', JSON.stringify(await batchPage.evaluate(() => ({ error: document.querySelector('.overview-error')?.textContent, moved: window.calls.filter(call => call[0] === 'move-tab').length, windows: [...new Set(window.testTabs.map(tab => tab.windowId))] }))));
     assert.equal(await batchPage.evaluate(() => new Set(window.testTabs.map(tab => tab.windowId)).size), 1, 'merge includes all windows even with a website filter active');
     assert.equal(await batchPage.evaluate(() => window.calls.filter(call => call[0] === 'move-tab').length), 80);
+    await batchPage.getByRole('button', { name: '更多选项', exact: true }).click();
     await batchPage.getByRole('button', { name: '合并窗口', exact: true }).click();
-    await batchPage.getByText('没有需要合并的标签', { exact: true }).waitFor();
+    await batchPage.getByText('0 个页面将移动', { exact: true }).waitFor();
+    assert(await batchPage.getByRole('button', { name: '合并所选窗口', exact: true }).isDisabled());
+    await batchPage.keyboard.press('Escape');
     assert.equal(await batchPage.evaluate(() => window.calls.filter(call => call[0] === 'move-tab').length), 80);
     await batchPage.setViewportSize({ width: 360, height: 780 });
     await batchPage.getByRole('button', { name: '多选', exact: true }).click();
     assert(await batchPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'batch controls fit narrow windows');
     await batchPage.close();
     assert.deepEqual(errors, []);
-    console.log('PASS: overview interactions, stable order/labels, window+domain filters, undo and timeout, live thumbnails, cache isolation, restart fallback, worker resizing and cache bounds.');
+    const toolsPage = await browser.newPage({ viewport: { width: 1080, height: 820 } });
+    toolsPage.on('pageerror', error => errors.push(error.message));
+    await toolsPage.addInitScript(setupBrowser);
+    await toolsPage.addInitScript(() => {
+      window.testTabs = window.testTabs.slice(0,12).map((tab,i)=>({...tab,windowId:Math.floor(i/4)+1,groupId:-1}));
+      window.testTabs[1].url=window.testTabs[0].url;window.testTabs[2].url=window.testTabs[0].url;
+      window.testTabs[0].pinned=true;window.testTabs[1].audible=true;
+    });
+    await toolsPage.goto(base+'/overview/index.html');await toolsPage.locator('[data-tab-id="1"]').waitFor();
+    const openTool = async name => {await toolsPage.getByRole('button',{name:'更多选项',exact:true}).click();await toolsPage.getByRole('button',{name,exact:true}).click();};
+    await openTool('检查重复页面');
+    let dialog=toolsPage.getByRole('dialog',{name:'检查重复页面',exact:true});
+    assert.equal(await dialog.getByRole('checkbox').count(),3);
+    assert.equal(await dialog.locator('input:checked').count(),1,'protected copies not default selected');
+    assert.equal(await dialog.locator('input:checked').getAttribute('aria-label'),'关闭副本：页面 3 · 项目');
+    await dialog.getByRole('button',{name:'关闭所选副本',exact:true}).click();await dialog.waitFor({state:'detached'});
+    assert.deepEqual(await toolsPage.evaluate(()=>window.calls.filter(c=>c[0]==='remove-tab').map(c=>c[1])),[3]);
+    await toolsPage.getByRole('button',{name:/^撤销/}).click();await toolsPage.locator('[data-tab-id="1003"]').waitFor();
+    await toolsPage.getByRole('button',{name:'多选',exact:true}).click();await toolsPage.locator('[data-tab-id="4"]').getByRole('checkbox').click();
+    await toolsPage.getByRole('button',{name:'移动所选',exact:true}).click();
+    dialog=toolsPage.getByRole('dialog',{name:'移动所选页面',exact:true});await dialog.getByLabel('目标窗口',{exact:true}).selectOption('2');
+    assert.equal(await dialog.getByLabel('目标窗口',{exact:true}).evaluate(el=>getComputedStyle(el).outlineStyle),'none');
+    await dialog.getByRole('button',{name:'移动页面',exact:true}).click();await dialog.waitFor({state:'detached'});
+    assert.equal(await toolsPage.evaluate(()=>window.testTabs.find(t=>t.id===4).windowId),2);assert.equal(await toolsPage.evaluate(()=>window.calls.filter(c=>c[0]==='move-tab').length),1);
+    await toolsPage.getByRole('button',{name:'取消',exact:true}).click();
+    await openTool('合并窗口');dialog=toolsPage.getByRole('dialog',{name:'合并窗口',exact:true});
+    await dialog.getByLabel('目标窗口',{exact:true}).selectOption('1');
+    await dialog.locator('label').filter({hasText:/^窗口 3/}).getByRole('checkbox').uncheck();
+    assert((await dialog.innerText()).includes('5 个页面将移动'));
+    await dialog.getByRole('button',{name:'合并所选窗口',exact:true}).click();await dialog.waitFor({state:'detached'});
+    assert.equal(await toolsPage.evaluate(()=>window.testTabs.filter(t=>t.windowId===3).length),4,'unselected source window unchanged');
+    await openTool('设置');dialog=toolsPage.getByRole('dialog',{name:'设置',exact:true});
+    await dialog.getByRole('checkbox',{name:/随浏览自动更新/}).uncheck();
+    await toolsPage.waitForFunction(()=>window.testLocal.glimpsePreviewSettings?.paused);
+    await dialog.getByRole('checkbox',{name:'悬停放大预览',exact:true}).uncheck();
+    await toolsPage.waitForFunction(()=>window.testLocal.glimpsePreviewSettings?.hoverPreview===false);
+    await dialog.getByRole('textbox',{name:'排除网站',exact:true}).fill('https://github.com/some/path');
+    await dialog.getByRole('button',{name:'添加',exact:true}).click();
+    await dialog.getByRole('button',{name:'移除排除网站 github.com',exact:true}).waitFor();
+    await toolsPage.waitForFunction(()=>window.testLocal.glimpsePreviewSettings?.excludedHosts.includes('github.com'));
+    assert.deepEqual(await toolsPage.evaluate(()=>window.testLocal.glimpsePreviewSettings.excludedHosts),['github.com']);
+    for(const viewport of [{width:360,height:640},{width:540,height:360}]){
+      await toolsPage.setViewportSize(viewport);
+      await toolsPage.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+      const box=await dialog.boundingBox();assert(box.x>=0&&box.y>=0&&box.x+box.width<=viewport.width&&box.y+box.height<=viewport.height,'settings fits narrow/short viewport');
+      assert(await toolsPage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+      await toolsPage.waitForFunction(()=>document.querySelector('dialog')?.getAttribute('aria-busy')==='false');
+      await dialog.getByRole('button',{name:'关闭面板',exact:true}).focus();await toolsPage.keyboard.press('Shift+Tab');
+      assert(await toolsPage.evaluate(()=>document.querySelector('dialog').contains(document.activeElement)),'modal traps focus');
+    }
+    if(process.env.GLIMPSE_SETTINGS_SCREENSHOT){await toolsPage.setViewportSize({width:1080,height:820});await toolsPage.screenshot({path:process.env.GLIMPSE_SETTINGS_SCREENSHOT});}
+    await toolsPage.keyboard.press('Escape');await dialog.waitFor({state:'detached'});
+    assert(await toolsPage.getByRole('button',{name:'更多选项',exact:true}).evaluate(el=>el===document.activeElement),'dialog restores trigger focus');
+    assert.equal(await toolsPage.evaluate(()=>window.calls.filter(c=>c[0]==='close-overview').length),0,'dialog Escape leaves overview open');
+    await toolsPage.setViewportSize({width:1080,height:820});
+    await toolsPage.locator('[data-tab-id="1"] .placeholder-status').getByText('已排除预览').waitFor();
+    const noZoom=toolsPage.locator('[data-tab-id="1"] .tab-surface');await noZoom.hover();await toolsPage.waitForTimeout(280);
+    assert.equal(await noZoom.evaluate(el=>new DOMMatrix(getComputedStyle(el).transform).a),1,'hover preference disables enlargement');
+    await toolsPage.reload();await toolsPage.waitForFunction(()=>document.querySelector('main')?.dataset.hoverPreview==='false');
+    await openTool('设置');dialog=toolsPage.getByRole('dialog',{name:'设置',exact:true});
+    assert.equal(await dialog.getByRole('checkbox',{name:/随浏览自动更新/}).isChecked(),false);
+    await dialog.getByRole('button',{name:'移除排除网站 github.com',exact:true}).click();
+    await dialog.getByRole('button',{name:'移除排除网站 github.com',exact:true}).waitFor({state:'detached'});
+    await dialog.getByRole('checkbox',{name:/随浏览自动更新/}).check();
+    await dialog.getByRole('button',{name:'刷新活动页面预览',exact:true}).click();await dialog.getByText('已安排刷新 1 个窗口的活动页面。').waitFor();
+    await toolsPage.close();
+    assert.deepEqual(errors, []);
+    console.log('PASS: overview interactions, searchable pickers, IME/focus/Escape, search scope/highlights, recent snapshots, density persistence, narrow layouts, undo/batch actions, thumbnails and cache isolation.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => server.close());

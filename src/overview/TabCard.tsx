@@ -1,10 +1,15 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent } from 'react';
-import { X, Globe, Check, ImageOff } from 'lucide-react';
+import { X, Globe, Check, ImageOff, Pin, Volume2, VolumeX, Moon } from 'lucide-react';
 import type { TabInfo } from '../lib/tabManager';
-import { canCaptureUrl, getThumbnail } from '../lib/thumbnailCache';
+import { getThumbnail } from '../lib/thumbnailCache';
+import { getPreviewState, describePreview } from '../lib/previewState';
+import type { PreviewState } from '../lib/previewState';
 import type { Thumbnail } from '../lib/thumbnailCache';
+import { HighlightedText } from './HighlightedText';
 import { tabDomain } from '../lib/tabDomain';
+import { excludedUrl } from '../lib/previewSettings';
+import type { PreviewSettings } from '../lib/previewSettings';
 
 const hoverControllers = new WeakMap<Element, () => void>();
 
@@ -30,6 +35,9 @@ function aimsAtButton(from: { x: number; y: number }, x: number, y: number, butt
 
 interface TabCardProps {
   tab: TabInfo;
+  previewSettings: PreviewSettings;
+  previewReady: boolean;
+  query: string;
   isSelected: boolean;
   selectionMode: boolean;
   checked: boolean;
@@ -53,30 +61,39 @@ function Favicon({ tab }: { tab: TabInfo }) {
     : <Globe size={16} aria-hidden="true" />;
 }
 
-export const TabCard = memo(function TabCard({ tab, isSelected, selectionMode, checked, disabled, windowNumber, style, onClick, onClose, onFocus, onFilterWindow }: TabCardProps) {
+export const TabCard = memo(function TabCard({ tab, previewSettings, previewReady, query, isSelected, selectionMode, checked, disabled, windowNumber, style, onClick, onClose, onFocus, onFilterWindow }: TabCardProps) {
   const cellRef = useRef<HTMLDivElement>(null);
   const hitRef = useRef<HTMLButtonElement>(null);
   const pointerAnchor = useRef<{ x: number; y: number } | null>(null);
-  const [thumbnail, setThumbnail] = useState<{ url: string; image: Thumbnail | null } | null>(null);
-  const image = thumbnail?.url === tab.url && !tab.incognito ? thumbnail.image : null;
+  const [thumbnail, setThumbnail] = useState<{ url: string; image: Thumbnail | null; state?: PreviewState | null; readFailed?: boolean } | null>(null);
+  const image = thumbnail?.url === tab.url && previewReady && !tab.incognito && !excludedUrl(tab.url, previewSettings) ? thumbnail.image : null;
   const thumbnailUrl = image?.dataUrl;
+  const stateLabels = [tab.pinned && '固定标签', tab.audible && (tab.muted ? '已静音' : '正在发声'), tab.discarded && '已休眠'].filter(Boolean).join('，');
+  const preview = describePreview(tab, thumbnail?.url === tab.url ? thumbnail.state ?? null : null, thumbnail?.url === tab.url && thumbnail.readFailed, previewSettings);
+  const badge = image && (image.previous ? '上次浏览' : thumbnail?.state?.status === 'permission' || thumbnail?.state?.status === 'failed' ? '已保存预览' : '');
 
   useEffect(() => {
     let mounted = true, revision = 0;
     const load = async () => {
       const current = ++revision;
       try {
-        const image = tab.incognito ? null : await getThumbnail(tab.id, tab.url);
-        if (mounted && current === revision) setThumbnail({ url: tab.url, image });
-      } catch { if (mounted && current === revision) setThumbnail({ url: tab.url, image: null }); }
+        const [image, state] = !previewReady || tab.incognito || excludedUrl(tab.url, previewSettings) ? [null, null] : await Promise.all([
+          getThumbnail(tab.id, tab.url), getPreviewState(tab.id, tab.url).catch(() => null)
+        ]);
+        if (mounted && current === revision) setThumbnail({ url: tab.url, image, state });
+      } catch {
+        if (mounted && current === revision) setThumbnail(previous => ({ url: tab.url,
+          image: previous?.url === tab.url ? previous.image : null, readFailed: true }));
+      }
     };
     const updated = (message: { type?: string; tabId?: number; url?: string }) => {
-      if (message?.type === 'mosaic:thumbnail-updated' && message.tabId === tab.id && message.url === tab.url) void load();
+      if (message?.type === 'glimpse:cache-changed') { void load(); return; }
+      if (['mosaic:thumbnail-updated', 'glimpse:preview-state'].includes(message?.type ?? '') && message.tabId === tab.id && message.url === tab.url) void load();
     };
     chrome.runtime.onMessage.addListener(updated);
     void load();
     return () => { mounted = false; chrome.runtime.onMessage.removeListener(updated); };
-  }, [tab.url, tab.id, tab.incognito]);
+  }, [tab.url, tab.id, tab.incognito, previewSettings, previewReady]);
 
   function collapse() {
     pointerAnchor.current = null;
@@ -89,7 +106,7 @@ export const TabCard = memo(function TabCard({ tab, isSelected, selectionMode, c
   function expand() {
     const cell = cellRef.current, hit = hitRef.current;
     const viewport = cell?.closest('.tab-viewport');
-    if (!cell || !hit || !viewport || cell.dataset.expanded === 'true') return;
+    if (!cell || !hit || !viewport || cell.closest('main')?.dataset.hoverPreview === 'false' || cell.dataset.expanded === 'true') return;
     // Measure zoom geometry only on entry; all content shares one transform.
     const box = hit.getBoundingClientRect(), bounds = viewport.getBoundingClientRect();
     const scale = Math.max(1, Math.min(1.38, 490 / box.width, (bounds.width - 16) / box.width, (bounds.height - 16) / box.height));
@@ -112,7 +129,7 @@ export const TabCard = memo(function TabCard({ tab, isSelected, selectionMode, c
   useLayoutEffect(() => {
     const cell = cellRef.current;
     if (cell) { cell.dataset.expanded = 'false'; cell.style.zIndex = '0'; }
-  }, [style.left, style.top, style.width, style.height]);
+  }, [style.left, style.top, style.width, style.height, previewSettings.hoverPreview]);
 
   useEffect(() => {
     const cell = cellRef.current, viewport = cell?.closest('.tab-viewport');
@@ -153,8 +170,9 @@ export const TabCard = memo(function TabCard({ tab, isSelected, selectionMode, c
       if (e.propertyName === 'transform' && e.currentTarget.dataset.expanded !== 'true') e.currentTarget.style.zIndex = '0';
     }}>
     <div className="tab-slot">
-      <button ref={hitRef} type="button" className="tab-hit" disabled={disabled}
+      <button ref={hitRef} type="button" className="tab-hit" disabled={disabled} title={tab.title}
         aria-label={selectionMode ? `选择标签页：${tab.title}` : `切换到窗口 ${windowNumber}：${tab.title}`}
+        aria-description={[stateLabels, thumbnailUrl ? badge ? `${badge}，${preview.detail}` : '已有页面预览' : preview.detail].filter(Boolean).join('，')}
         aria-pressed={selectionMode ? checked : isSelected} onClick={onClick} />
       <div className="tab-surface" onClick={e => {
         if ((e.target as Element).closest('button')) return;
@@ -162,17 +180,20 @@ export const TabCard = memo(function TabCard({ tab, isSelected, selectionMode, c
       }}>
         <div className="tab-thumbnail" aria-hidden="true">
           {thumbnailUrl ? <img className="tab-screenshot" src={thumbnailUrl} alt="" draggable={false}
-            onError={() => setThumbnail({ url: tab.url, image: null })} /> :
-            <div className="tab-placeholder" title={tab.incognito ? '隐身页面不保存预览' : canCaptureUrl(tab.url) ? '浏览后自动生成预览' : '此页面不支持自动预览'}>
+            onError={() => setThumbnail(previous => ({ ...previous, url: tab.url, image: null, readFailed: true }))} /> :
+            <div className="tab-placeholder" title={preview.detail}>
               <span className="placeholder-site">{tabDomain(tab.url)}</span>
-              <span className="placeholder-title">{tab.title || '未命名标签页'}</span>
-              <span className="placeholder-status"><ImageOff size={14} aria-hidden="true" />{tab.incognito ? '隐身页面' : canCaptureUrl(tab.url) ? '暂无预览' : '不支持预览'}</span>
+              <span className="placeholder-title"><HighlightedText text={tab.title || '未命名标签页'} query={query} /></span>
+              <span className="placeholder-status"><ImageOff size={14} aria-hidden="true" />{preview.label}</span>
             </div>}
-          {image?.previous && <span className="thumbnail-badge">上次浏览</span>}
+          {stateLabels && <span className="tab-state-icons" title={stateLabels}>
+            {tab.pinned && <Pin size={12} />}{tab.audible && (tab.muted ? <VolumeX size={12} /> : <Volume2 size={12} />)}{tab.discarded && <Moon size={12} />}
+          </span>}
+          {badge && <span className="thumbnail-badge" title={'保存于 ' + new Date(image!.timestamp).toLocaleString() + '。' + (thumbnail?.state?.status === 'ready' || !thumbnail?.state ? '浏览页面后自动更新' : preview.detail)}>{badge}</span>}
         </div>
         <div className="tab-caption">
           <span className="tab-favicon" aria-hidden="true"><Favicon key={tab.url} tab={tab} /></span>
-          <div className="tab-caption-text" aria-hidden="true"><div className="tab-title">{tab.title || '未命名标签页'}</div><div className="tab-domain">{tabDomain(tab.url)}</div></div>
+          <div className="tab-caption-text" aria-hidden="true"><div className="tab-title" title={tab.title}><HighlightedText text={tab.title || '未命名标签页'} query={query} /></div><div className="tab-domain"><HighlightedText text={tabDomain(tab.url)} query={query} /></div></div>
           <button type="button" className="tab-window tab-window-filter" disabled={disabled} aria-label={`只看窗口 ${windowNumber}`} onClick={e => { e.stopPropagation(); onFilterWindow(); }}>窗口 {windowNumber}</button>
           {tab.active && <span className="tab-active" aria-hidden="true" />}
         </div>

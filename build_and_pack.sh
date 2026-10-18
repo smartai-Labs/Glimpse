@@ -1,30 +1,11 @@
-#!/bin/bash
-
-# Exit immediately if a command exits with a non-zero status
-set -e
-
-echo "Building the extension..."
-npm run build
-
-ZIP_NAME="glimpse-extension.zip"
-
-echo "Packaging the extension into $ZIP_NAME..."
-
-# Remove old zip if it exists
-if [ -f "$ZIP_NAME" ]; then
-    rm "$ZIP_NAME"
-fi
-
-# Ensure dist exists
-if [ ! -d "dist" ]; then
-    echo "Error: dist directory does not exist! Build failed?"
-    exit 1
-fi
-
-# Zip the contents of dist
-cd dist
-zip -r "../$ZIP_NAME" ./*
-cd ..
-
-echo "✅ Successfully created $ZIP_NAME"
-echo "You can now send this file to your friends! They just need to unzip it and use 'Load unpacked' on the resulting folder in chrome://extensions."
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+npm run check
+node scripts/verify-build.cjs
+version="$(node -p "require('./package.json').version")"
+zip_name="glimpse-${version}.zip"
+# Only replace this version's generated package in the project directory.
+if [ -f "$zip_name" ]; then rm -- "$zip_name"; fi
+(cd dist && zip -qr "../$zip_name" .)
+echo "Created $zip_name"

@@ -1,24 +1,26 @@
 {
   "name": "glimpse",
   "private": true,
-  "version": "1.9.0",
+  "version": "1.12.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node scripts/test.cjs",
+    "test:browser": "node tests/overview.browser.cjs",
+    "test:extension": "node tests/extension.smoke.cjs",
+    "check": "npm run build && npm run lint && npm test && npm run test:browser && npm run test:extension",
+    "package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1"
   },
   "dependencies": {
-    "clsx": "^2.1.1",
-    "framer-motion": "^12.36.0",
     "fuse.js": "^7.1.0",
     "idb-keyval": "^6.2.2",
     "lucide-react": "^0.577.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "react-window": "^1.8.11",
-    "tailwind-merge": "^3.5.0"
+    "react-window": "^1.8.11"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
@@ -34,10 +36,14 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.4.0",
+    "playwright": "^1.62.1",
     "postcss": "^8.5.8",
     "tailwindcss": "^4.2.1",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.56.1",
-    "vite": "^5.4.21"
+    "vite": "^6.4.4"
+  },
+  "engines": {
+    "node": ">=20.19.0"
   }
 }

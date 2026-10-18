@@ -41,12 +41,13 @@ async function readClosedSessions(): Promise<chrome.sessions.Session[] | null> {
   finally { clearTimeout(timer); }
 }
 
-export function closeWithUndo(tab: TabInfo): Promise<ClosedTab> {
+export function closeWithUndo(tab: TabInfo, validate?: () => Promise<void>): Promise<ClosedTab> {
   // Serialize our close operations so same-URL tabs don't claim each other's session.
   const operation = closeQueue.then(async () => {
     const token = crypto.randomUUID();
     const recent = tab.incognito ? null : await readClosedSessions();
     const before = recent === null ? null : new Set(recent.map(sessionId));
+    await validate?.();
     await chrome.tabs.remove(tab.id);
     let restoredSession: string | undefined;
     try {

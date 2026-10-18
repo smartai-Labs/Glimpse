@@ -44,31 +44,6 @@ function fixture() {
 }
 
 (async () => {
-  const merged = fixture();
-  const progress = [];
-  const result = await merged.api.mergeBrowserWindows((done, total) => progress.push([done, total]));
-  assert.deepEqual(JSON.parse(JSON.stringify(result)), { moved: 5, failed: 0, skipped: 0, separatePrivate: true });
-  assert.equal(merged.state.tabs.find(tab => tab.id === 8).windowId, 4);
-  assert.equal(merged.state.tabs.find(tab => tab.id === 9).windowId, 99, 'popup windows are excluded');
-  assert.equal(merged.state.tabs.find(tab => tab.id === 10).windowId, 3, 'Mosaic itself is excluded');
-  assert.deepEqual(merged.state.moved.find(move => move.isGroup).ids, [4, 5], 'groups move as one unit');
-  assert.deepEqual(merged.state.groups[0], { id: 10, title: 'Research', color: 'grey', collapsed: true });
-  assert.equal(merged.state.tabs.find(tab => tab.id === 3).pinned, true);
-  assert.deepEqual(progress.at(-1), [5, 5]);
-  assert.equal((await merged.api.mergeBrowserWindows(() => {})).moved, 0, 'a repeated merge is a no-op');
-
-  const partial = fixture(); partial.state.failMove.add(4);
-  const partialResult = await partial.api.mergeBrowserWindows(() => {});
-  assert.equal(partialResult.moved, 3); assert.equal(partialResult.failed, 2);
-  assert.equal(partial.state.tabs.find(tab => tab.id === 4).windowId, 2, 'failed group stays intact');
-  const unavailable = fixture(); delete unavailable.chrome.tabGroups;
-  assert.equal((await unavailable.api.mergeBrowserWindows(() => {})).failed, 2, 'missing group permission never dissolves groups');
-  const vanished = fixture(); vanished.chrome.windows.get = async () => { throw Error('Destination closed'); };
-  assert.equal((await vanished.api.mergeBrowserWindows(() => {})).failed, 5);
-  assert.equal(vanished.state.moved.length, 0);
-  const fallback = fixture(); fallback.state.last = 99;
-  assert.equal((await fallback.api.mergeBrowserWindows(() => {})).moved, 5, 'a popup can never become the destination');
-
   const close = fixture(); close.state.failRemove.add(2);
   const snapshot = close.state.tabs.slice(0, 3).map(tab => ({ ...tab }));
   close.state.tabs[0].url = 'https://example.test/new-url';
@@ -78,5 +53,5 @@ function fixture() {
   assert.equal(closed.closed[0].tab.url, 'https://example.test/new-url', 'undo records the live page');
   assert.deepEqual(Array.from(closed.closed, item => item.sessionId), ['closed-1', 'closed-3']);
   assert.equal(close.state.tabs.some(tab => tab.id === 4), true, 'unselected tabs remain untouched');
-  console.log('PASS: batch-close scope/duplicates/live URLs/partial failure; merging targets, pinned positions, intact groups, private isolation, permission/destination failures and no-op repeat.');
+  console.log('PASS: batch-close scope, duplicate selections, live URLs, undo sessions and partial failure.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

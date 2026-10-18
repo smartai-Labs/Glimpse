@@ -7,6 +7,13 @@ export interface TabInfo {
   active: boolean;
   index: number;
   incognito?: boolean;
+  status?: chrome.tabs.Tab['status'];
+  discarded?: boolean;
+  pinned?: boolean;
+  audible?: boolean;
+  muted?: boolean;
+  lastAccessed?: number;
+  groupId?: number;
 }
 
 export async function getAllTabs(): Promise<TabInfo[]> {
@@ -26,7 +33,14 @@ export async function getAllTabs(): Promise<TabInfo[]> {
       windowId: tab.windowId,
       active: tab.active,
       index: tab.index,
-      incognito: tab.incognito
+      incognito: tab.incognito,
+      status: tab.status,
+      discarded: tab.discarded,
+      pinned: tab.pinned,
+      audible: tab.audible,
+      muted: tab.mutedInfo?.muted,
+      groupId: tab.groupId,
+      lastAccessed: tab.lastAccessed
     }));
 
   const targetWindowId = lastFocused ? lastFocused.id : mappedTabs.find(t => t.active)?.windowId;
